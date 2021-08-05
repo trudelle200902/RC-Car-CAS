@@ -68,6 +68,9 @@
  *  if user is in safeMode and get really close to a wall user enter danger mode
  *  if user enter dangerMode stop car until user go to neutral and allow only reverse and neutral contrl
  *  if user is in dangerMode, it is enabled until user isn't near wall
+ *  
+ *  try fixing problem that when starting rc cant automatically take controll or make sure that if user
+ *  start car infront of obstacle it at least wait until the connection is well made before taking control
  */
 #include <Servo.h>//to help sending pwm signal to ESC 
 
