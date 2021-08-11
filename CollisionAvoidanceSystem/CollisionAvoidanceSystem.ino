@@ -60,41 +60,63 @@
 */
 ///////////////////////////////////////////////////////////
 /*
- * TODO
- *  if rc in neutral and near a wall dont go on reverse
- *  if rc is stopped wait for user to go on neutral then give back control to user but in safeMode 
- *  if in safe mode and user get away from wall disable safe mode
- *  if user go foward in safeMode go 10% of speed
- *  if user is in safeMode and get really close to a wall user enter danger mode
- *  if user enter dangerMode stop car until user go to neutral and allow only reverse and neutral contrl
- *  if user is in dangerMode, it is enabled until user isn't near wall
- *  
- *  try fixing problem that when starting rc cant automatically take controll or make sure that if user
- *  start car infront of obstacle it at least wait until the connection is well made before taking control
- */
+   TODO
+    if rc in neutral and near a wall dont go on reverse
+    if rc is stopped wait for user to go on neutral then give back control to user but in MODE_SAFE
+    if in safe mode and user get away from wall disable safe mode
+    if user go foward in MODE_SAFE go 10% of speed
+    if user is in MODE_SAFE and get really close to a wall user enter danger mode
+    if user enter MODE_DANGER stop car until user go to neutral and allow only reverse and neutral contrl
+    if user is in MODE_DANGER, it is enabled until user isn't near wall
+
+    try fixing problem that when starting rc cant automatically take controll or make sure that if user
+    start car infront of obstacle it at least wait until the connection is well made before taking control
+*/
 #include <Servo.h>//to help sending pwm signal to ESC 
 
-const int IN_PWM = 2;//interrupt pin intercepting signal sent by receiver to ESC
-const int OUT_PWM = 8;//output pin sending back intercepted signal to the ESC
-const int ECHO = 3;//interrupt pin receiving the signal sent back by the UDS representing the time to receive signal after sending it in us
-const int TRIGGER = 4;//output pin sending a signal of 10 us to the HC-Sr04 to activate it
+#define PWM_IN_PIN 2//interrupt pin intercepting signal sent by receiver to ESC
+#define PWM_OUT_PIN 8//output pin sending back intercepted signal to the ESC
+#define ECHO_PIN 3//interrupt pin receiving the signal sent back by the UDS representing the time to receive signal after sending it in us
+#define TRIGGER_PIN 4//output pin sending a signal of 10 us to the HC-Sr04 to activate it
 
-const long BREAKVAL = 1000;//width in Micro seconds of PWM signal associated to breaking
+#define MODE_NORMAL 0
+#define MODE_SAFE 1
+#define MODE_DANGER 2
+#define REVERSE 0
+#define NEUTRAL 1
+#define DRIVE 2
+#define BACKWARD 0
+#define IMMOBILE 1//change bame
+#define FOWARD 2
 
-long breakDistance = 10;//in cm
-Servo transmitedPwm;
+#define VAL_BREAK 1000//width in Micro seconds of PWM signal associated to breaking
+#define VAL_NEUTRAL 1470
+//#define TIMERBREAKDELAY 200000
+#define DELAY_TIMER_TRIGGER 200000
+#define DELAY_TIMER_BREAK_OVERRIDE 2000000
 
-volatile bool breaking = false, sendNewTrig = true, immobile;
-volatile unsigned long pulseStartTime, pulseWidth, lastPulse, echoStart, echoDuration, wallDistance;
+const int BREAK_DISTANCES[] = {1700, 700, 300};//in mm
 
-/////////////////testing/debuging variable
-const bool TESTING = false;
-const bool DEBUGING = false;
-//volatile int signalState = LOW;
-//const int arrayLength = 100;
-//volatile int rxValue[arrayLength];
-//volatile unsigned int index = 0;
+Servo my_transmitter;
+//use enum instead
+byte car_mode;//0 = normal(user have complete control), 1 = safe mode(10% foward speed), 2 = danger mode()
+byte car_state;//0 moving back 1 not moving 2 moving foward
+//byte controllerState =1;//0 reverse 1 neutral 2 foward
 
+volatile unsigned long rx_pulse_length;
+volatile float wall_distance;
+volatile bool is_accurate_distance;
+
+////////testing/debuging variable////////
+#define BLUE_PIN 10
+#define RED_PIN 11
+#define YELLOW_PIN 12
+#define GREEN_PIN 13
+volatile bool is_using_serial_debug = false;
+bool prob = false;
+
+
+//////////////////////////////////////CODE START//////////////////////////////////////
 
 /*
    method called at the start of program. Set
@@ -102,19 +124,23 @@ const bool DEBUGING = false;
    and set pin that return new PWM signal
 */
 void setup() {
-  if (TESTING || DEBUGING) {
-    Serial.begin(9600);
-  }
+  Serial.begin(9600);
 
-  pinMode(IN_PWM, INPUT);
-  pinMode(ECHO, INPUT);
-  pinMode(TRIGGER, OUTPUT);
-  transmitedPwm.attach(OUT_PWM);
+  pinMode(PWM_IN_PIN, INPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(TRIGGER_PIN, OUTPUT);
+  my_transmitter.attach(PWM_OUT_PIN);
 
-  attachInterrupt(digitalPinToInterrupt(IN_PWM), calcSignal, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ECHO), calcDistance, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PWM_IN_PIN), handle_rx_signal_isr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ECHO_PIN), handle_uds_echo_isr, CHANGE);
 
-  digitalWrite(TRIGGER, LOW);//not sure is useful
+  digitalWrite(TRIGGER_PIN, LOW);//not sure is useful
+
+
+  pinMode(BLUE_PIN, OUTPUT);
+  pinMode(RED_PIN, OUTPUT);
+  pinMode(YELLOW_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
 }
 
 /*
@@ -122,18 +148,73 @@ void setup() {
    - transmit signal to the ESC depending on value of breaking
 */
 void loop() {
-  if (breaking) {
-    transmitedPwm.writeMicroseconds(BREAKVAL);
+  static bool is_breaking = false;
+  static bool is_user_controlling = true;
+  static long timer_break_override;
+  static long timer_trigger;
+
+  if (timer_trigger <= micros()) {
+    send_pulse_uds();
+    car_state = read_car_state();//just put it in  send_pulse_uds()
+    timer_trigger = micros() + DELAY_TIMER_TRIGGER;
+  }
+
+  if (!is_user_controlling) {
+    if (car_state != FOWARD && is_breaking) {
+      timer_break_override = micros() + DELAY_TIMER_BREAK_OVERRIDE;
+      is_breaking = false;
+    }else if(car_state == FOWARD && !is_breaking){
+      is_breaking = true;
+    }
+    //check if car is immobile if the break timer has ended
+    if (((timer_break_override <= micros() && car_mode == MODE_SAFE) || get_controller_state() == NEUTRAL) && !is_breaking) {
+      //is_breaking = false;
+      is_user_controlling = true;
+    }
+    if (wall_distance <= BREAK_DISTANCES[car_mode]) {
+      car_mode++;
+      if (car_mode > MODE_DANGER) {
+        car_mode = MODE_DANGER;
+      }
+      if (car_state == FOWARD) {
+        is_breaking = true;
+        is_user_controlling = false;
+      }
+    }
+  } else if (wall_distance <= BREAK_DISTANCES[car_mode]) {
+    car_mode++;
+    if (car_mode > MODE_DANGER) {
+      car_mode = MODE_DANGER;
+    }
+    if (car_state == FOWARD) {
+      is_breaking = true;
+      is_user_controlling = false;
+    }
+  } else if (car_mode != MODE_NORMAL && wall_distance >= BREAK_DISTANCES[car_mode - 1]) {
+    car_mode--;
+  }
+
+
+  long my_pulse_length;
+  if (is_breaking && get_controller_state() == DRIVE) {
+    my_pulse_length = VAL_BREAK;
+  } else if (!is_user_controlling && get_controller_state() == DRIVE) {
+    my_pulse_length = VAL_NEUTRAL;
+  } else if (car_mode == MODE_SAFE && get_controller_state() == DRIVE) {
+    my_pulse_length = ((rx_pulse_length - 1495) * 0.25) + 1495;
+  } else if (car_mode == MODE_DANGER && get_controller_state() == DRIVE) {
+    my_pulse_length = VAL_NEUTRAL;
   } else {
-    transmitedPwm.writeMicroseconds(pulseWidth);
+    my_pulse_length = rx_pulse_length;
   }
-  if (sendNewTrig) {
-    sendNewTrig = false;
-    digitalWrite(TRIGGER, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(TRIGGER, LOW);
+
+  my_transmitter.writeMicroseconds(my_pulse_length);
+
+  //////////DEBUG//////////
+  if (is_using_serial_debug) {
+    write_serial_debug(my_pulse_length, is_user_controlling, is_breaking);
   }
-  delay(300);
+  write_debug_led_state(is_breaking);
 }
 
 /*
@@ -141,36 +222,95 @@ void loop() {
    on the receiver pin.It is used to calculate the value
    of the PWM signal sent by the receiver.
 */
-void calcSignal() {
-  if (digitalRead(IN_PWM) == HIGH) {
-    pulseStartTime = micros();
+void handle_rx_signal_isr() {
+  static long time_start_pulse;
+  if (digitalRead(PWM_IN_PIN) == HIGH) {
+    time_start_pulse = micros();
   } else {
-    pulseWidth = micros() - pulseStartTime;
+    rx_pulse_length = micros() - time_start_pulse;
   }
+  //checkControllerState();
 }
 
-void calcDistance() {
-  if (digitalRead(ECHO) == HIGH) {
-    echoStart = micros();
+
+void handle_uds_echo_isr() {
+  static long time_start_echo;
+  //test = true;
+  if (digitalRead(ECHO_PIN) == HIGH) {
+    time_start_echo = micros();
   } else {
-    echoDuration = micros() - echoStart;
-    wallDistance = (echoDuration / 2) * 0.034;//distance en cm
-    if (wallDistance != 0) {
-      breaking = (wallDistance <= breakDistance);
-      //Serial.println(wallDistance);
-      sendNewTrig = true;
+    float echo_length = micros() - time_start_echo;
+    float temp_wall_distance = (echo_length / 2) * 0.34;//distance en mm
+    if (temp_wall_distance != 0 && temp_wall_distance < 4000) {
+      wall_distance = temp_wall_distance;
+      is_accurate_distance = true;
+    } else {
+      is_accurate_distance = false;
     }
   }
 }
 
+void send_pulse_uds() {
+  digitalWrite(TRIGGER_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIGGER_PIN, LOW);
+}
+
+byte get_controller_state() {
+  if (1445 > rx_pulse_length) {
+    return  0;
+  } else if (1495 > rx_pulse_length) {
+    return 1;
+  } else {
+    return 2;
+  }
+}
+
+byte read_car_state() {
+  if (is_accurate_distance) {
+    static float last_position;
+    byte state;
+    if (last_position - wall_distance < -5) {
+      state = 0;
+    } else if (last_position - wall_distance < 5) {
+      state = 1;
+    } else {
+      state = 2;
+    }
+    last_position = wall_distance;
+    return state;
+  } else {
+    return car_state;
+  }
+}
 
 
-/*
-   when debugging called to manually break
-   car when an input is sent on Serial monitor
-*/
+//////////////////////////////////////////DEBUG FUNCTION/////////////////////////////////////////////
+void write_debug_led_state(bool is_breaking) {
+  digitalWrite(BLUE_PIN, is_breaking && get_controller_state() == DRIVE);
+  digitalWrite(GREEN_PIN, car_mode == MODE_NORMAL);
+  digitalWrite(YELLOW_PIN, car_mode == MODE_SAFE);
+  digitalWrite(RED_PIN, car_mode == MODE_DANGER);
+}
+
 void serialEvent() {
-  if (TESTING || DEBUGING) {
-    breaking = true;
+  if (!is_using_serial_debug) {
+
+    is_using_serial_debug = true;
+    Serial.println("DEBUG");
+  }
+  if (Serial.available() > 0) {
+    rx_pulse_length = Serial.readString().toInt();
+  }
+}
+
+void write_serial_debug(long my_pulse_length, bool is_user_controlling, bool is_breaking) {
+  static long testTimer;
+  if (testTimer <= micros()) {
+    //checkControllerState();
+    Serial.println(wall_distance);
+    Serial.println(my_pulse_length);
+    Serial.print(is_user_controlling); Serial.println(is_breaking);
+    testTimer = micros() + 1000000;
   }
 }
