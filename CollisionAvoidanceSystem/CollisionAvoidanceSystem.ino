@@ -32,7 +32,7 @@
     - Arduino 5v(Out) to BD-LLC LV(Input), UDS Vcc(In)
     - Arduino Gnd to BD-LLC Gnd for Lv, UDS Gnd
     - Arduino Pin 2(Input, Interrupt) to BD-LLC Lv Ch1 (Bidirectional)
-    - Arduino Pin 3(Input, Interrupt) to UDS Echo Pin(Output)
+    - Arduino Pin 3(Input, Interrupt) to UDS ECHO_PIN Pin(Output)
     - Arduino Pin 4(Output) to UDS Trig Pin(Input)
     - Arduino Pin 8(Output) to ESC Pwm (Input)
     - rx CH2 Pwm (Output) to BD-LLC Hv Ch1 (Bidirectional)
@@ -60,40 +60,58 @@
 */
 ///////////////////////////////////////////////////////////
 /*
- * TODO
- *  if rc in neutral and near a wall dont go on reverse
- *  if rc is stopped wait for user to go on neutral then give back control to user but in safeMode 
- *  if in safe mode and user get away from wall disable safe mode
- *  if user go foward in safeMode go 10% of speed
- *  if user is in safeMode and get really close to a wall user enter danger mode
- *  if user enter dangerMode stop car until user go to neutral and allow only reverse and neutral contrl
- *  if user is in dangerMode, it is enabled until user isn't near wall
- *  
- *  try fixing problem that when starting rc cant automatically take controll or make sure that if user
- *  start car infront of obstacle it at least wait until the connection is well made before taking control
- */
+   TODO
+    if rc in neutral and near a wall dont go on reverse
+    if rc is stopped wait for user to go on neutral then give back control to user but in safeMode
+    if in safe mode and user get away from wall disable safe mode
+    if user go foward in safeMode go 10% of speed
+    if user is in safeMode and get really close to a wall user enter danger mode
+    if user enter dangerMode stop car until user go to neutral and allow only reverse and neutral contrl
+    if user is in dangerMode, it is enabled until user isn't near wall
+
+    try fixing problem that when starting rc cant automatically take controll or make sure that if user
+    start car infront of obstacle it at least wait until the connection is well made before taking control
+*/
 #include <Servo.h>//to help sending pwm signal to ESC 
 
-const int IN_PWM = 2;//interrupt pin intercepting signal sent by receiver to ESC
-const int OUT_PWM = 8;//output pin sending back intercepted signal to the ESC
-const int ECHO = 3;//interrupt pin receiving the signal sent back by the UDS representing the time to receive signal after sending it in us
-const int TRIGGER = 4;//output pin sending a signal of 10 us to the HC-Sr04 to activate it
+#define PWM_IN_PIN 2//interrupt pin intercepting signal sent by receiver to ESC
+#define PWM_OUT_PIN 8//output pin sending back intercepted signal to the ESC
+#define ECHO_PIN 3//interrupt pin receiving the signal sent back by the UDS representing the time to receive signal after sending it in us
+#define TRIGGER_PIN 4//output pin sending a signal of 10 us to the HC-Sr04 to activate i
 
-const long BREAKVAL = 1000;//width in Micro seconds of PWM signal associated to breaking
+#define REVERSE 0
+#define NEUTRAL 1
+#define DRIVE 2
+#define BACKWARD 0
+#define IMMOBILE 1//change bame
+#define FOWARD 2
 
-long breakDistance = 10;//in cm
-Servo transmitedPwm;
+//#define DELAY_TIMER_TRIGGER 200000
+#define VAL_BREAK 1000//width in Micro seconds of PWM signal associated to breaking
+#define VAL_NEUTRAL 1470
 
-volatile bool breaking = false, sendNewTrig = true, immobile;
-volatile unsigned long pulseStartTime, pulseWidth, lastPulse, echoStart, echoDuration, wallDistance;
+#define BREAK_DISTANCE 1500//in mm
+
+Servo my_transmitter;
+bool is_breaking = false;
+//bool is_user_restricted = true;
+bool is_neutral = false;
+long timer_trigger;
+byte car_state;//0 moving back 1 not moving 2 moving foward
+
+volatile float wall_distance;
+volatile bool is_accurate_distance;
+
+//volatile bool sendNewTrig = true, immobile;
+volatile unsigned long rx_pulse_length;
+//volatile unsigned long pulseStartTime, pulseWidth, lastPulse, ECHO_PINStart, ECHO_PINDuration, wallDistance;
 
 /////////////////testing/debuging variable
-const bool TESTING = false;
-const bool DEBUGING = false;
-//volatile int signalState = LOW;
-//const int arrayLength = 100;
-//volatile int rxValue[arrayLength];
-//volatile unsigned int index = 0;
+#define BLUE_PIN 10
+#define RED_PIN 11
+#define YELLOW_PIN 12
+#define GREEN_PIN 13
+volatile bool is_using_serial_debug = false;
 
 
 /*
@@ -102,19 +120,22 @@ const bool DEBUGING = false;
    and set pin that return new PWM signal
 */
 void setup() {
-  if (TESTING || DEBUGING) {
-    Serial.begin(9600);
-  }
+  Serial.begin(9600);
 
-  pinMode(IN_PWM, INPUT);
-  pinMode(ECHO, INPUT);
-  pinMode(TRIGGER, OUTPUT);
-  transmitedPwm.attach(OUT_PWM);
+  pinMode(PWM_IN_PIN, INPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(TRIGGER_PIN, OUTPUT);
+  my_transmitter.attach(PWM_OUT_PIN);
 
-  attachInterrupt(digitalPinToInterrupt(IN_PWM), calcSignal, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ECHO), calcDistance, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PWM_IN_PIN), handle_rx_signal_isr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ECHO_PIN), handle_uds_echo_isr, CHANGE);
 
-  digitalWrite(TRIGGER, LOW);//not sure is useful
+  digitalWrite(TRIGGER_PIN, LOW);//not sure is useful
+
+  pinMode(BLUE_PIN, OUTPUT);
+  pinMode(RED_PIN, OUTPUT);
+  pinMode(YELLOW_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
 }
 
 /*
@@ -122,18 +143,52 @@ void setup() {
    - transmit signal to the ESC depending on value of breaking
 */
 void loop() {
-  if (breaking) {
-    transmitedPwm.writeMicroseconds(BREAKVAL);
-  } else {
-    transmitedPwm.writeMicroseconds(pulseWidth);
-  }
-  if (sendNewTrig) {
-    sendNewTrig = false;
-    digitalWrite(TRIGGER, HIGH);
+  long my_pulse_length;
+
+  if (timer_trigger <= micros()) {
+    digitalWrite(TRIGGER_PIN, HIGH);
     delayMicroseconds(10);
-    digitalWrite(TRIGGER, LOW);
+    digitalWrite(TRIGGER_PIN, LOW);
+
+    car_state = read_car_state();
+    timer_trigger = micros() + 200000/*DELAY_TIMER_TRIGGER*/;//set t
   }
-  delay(300);
+
+  //  if (sendNewTrig) {
+  //    sendNewTrig = false;
+  //    digitalWrite(TRIGGER_PIN, HIGH);
+  //    delayMicroseconds(10);
+  //    digitalWrite(TRIGGER_PIN, LOW);
+  //  }
+
+  if (wall_distance <= BREAK_DISTANCE && get_controller_state() == DRIVE && car_state == FOWARD && !(is_neutral || is_breaking)) {
+    is_breaking = true;
+  }else if (is_breaking && get_controller_state() == NEUTRAL && car_state != FOWARD) {
+    is_neutral = true;
+    is_breaking = false;
+  } else if (is_neutral && wall_distance > BREAK_DISTANCE/* || get_controller_state() == NEUTRAL*/) {
+    is_neutral = false;
+  } /*else if (wall_distance <= BREAK_DISTANCE) {
+    is_breaking = true;
+  }*/
+
+  if (is_breaking/* && get_controller_state() == DRIVE && car_state == FOWARD*/) {
+    my_pulse_length = VAL_BREAK;
+    digitalWrite(BLUE_PIN, HIGH);
+  } else if(is_neutral && get_controller_state() != REVERSE){
+    my_pulse_length = VAL_NEUTRAL;
+    digitalWrite(BLUE_PIN, LOW);
+  } else {
+    my_pulse_length = rx_pulse_length;
+    digitalWrite(BLUE_PIN, LOW);
+  }
+  my_transmitter.writeMicroseconds(my_pulse_length);
+
+  //////////DEBUG//////////
+  if (is_using_serial_debug) {
+    write_serial_debug(my_pulse_length);
+  }
+  write_debug_led_state();
 }
 
 /*
@@ -141,36 +196,94 @@ void loop() {
    on the receiver pin.It is used to calculate the value
    of the PWM signal sent by the receiver.
 */
-void calcSignal() {
-  if (digitalRead(IN_PWM) == HIGH) {
-    pulseStartTime = micros();
+void handle_rx_signal_isr() {
+  static long time_start_pulse;
+  if (digitalRead(PWM_IN_PIN) == HIGH) {
+    time_start_pulse = micros();
   } else {
-    pulseWidth = micros() - pulseStartTime;
+    rx_pulse_length = micros() - time_start_pulse;
   }
 }
 
-void calcDistance() {
-  if (digitalRead(ECHO) == HIGH) {
-    echoStart = micros();
+void handle_uds_echo_isr() {
+  static long time_start_echo;
+
+  if (digitalRead(ECHO_PIN) == HIGH) {
+    time_start_echo = micros();
   } else {
-    echoDuration = micros() - echoStart;
-    wallDistance = (echoDuration / 2) * 0.034;//distance en cm
-    if (wallDistance != 0) {
-      breaking = (wallDistance <= breakDistance);
-      //Serial.println(wallDistance);
-      sendNewTrig = true;
+    float echo_length = micros() - time_start_echo;
+    //wall-distance = (ECHO_PINDuration / 2) * 0.34;//distance en mm
+    float temp_wall_distance = (echo_length / 2) * 0.34;//distance en mm
+    if (temp_wall_distance != 0 && temp_wall_distance < 4000) {
+      wall_distance = temp_wall_distance;
+      is_accurate_distance = true;
+    } else {
+      is_accurate_distance = false;
     }
+
   }
 }
 
+byte get_controller_state() {
+  if (1445 > rx_pulse_length) {
+    return  0;
+  } else if (1495 > rx_pulse_length) {
+    return 1;
+  } else {
+    return 2;
+  }
+}
 
+byte read_car_state() {
+  if (is_accurate_distance) {
+    static float last_position;
+    byte state;
+    if (last_position - wall_distance < -5) {
+      state = 0;
+    } else if (last_position - wall_distance < 5) {
+      state = 1;
+    } else {
+      state = 2;
+    }
+    last_position = wall_distance;
+    return state;
+  } else {
+    return car_state;
+  }
+}
+
+//////////////////////////////////////////DEBUG FUNCTION/////////////////////////////////////////////
+void write_debug_led_state() {
+  //digitalWrite(BLUE_PIN, is_breaking && get_controller_state() == DRIVE);
+  //digitalWrite(GREEN_PIN, car_mode == MODE_NORMAL);
+  //digitalWrite(YELLOW_PIN, car_mode == MODE_SAFE);
+  //digitalWrite(RED_PIN, car_mode == MODE_DANGER);
+  digitalWrite(GREEN_PIN, !(is_breaking || is_neutral));
+  digitalWrite(YELLOW_PIN, is_neutral);
+  digitalWrite(RED_PIN, is_breaking);
+}
 
 /*
    when debugging called to manually break
    car when an input is sent on Serial monitor
 */
 void serialEvent() {
-  if (TESTING || DEBUGING) {
-    breaking = true;
+  if (!is_using_serial_debug) {
+
+    is_using_serial_debug = true;
+    Serial.println("DEBUG");
+  }
+  if (Serial.available() > 0) {
+    rx_pulse_length = Serial.readString().toInt();
+  }
+}
+
+void write_serial_debug(long my_pulse_length) {
+  static long test_timer;
+  if (test_timer <= micros()) {
+    Serial.println(wall_distance);
+    Serial.println(my_pulse_length);
+    Serial.print(is_breaking); Serial.println(is_neutral);
+    test_timer = micros() + 1000000;
   }
 }
